@@ -1,0 +1,156 @@
+---
+title: "Sydney Airbnb Pricing"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    theme: cosmo
+    favicon: null
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(tidyverse)
+library(leaflet)
+library(DT)
+library(broom)
+library(scales)
+
+set.seed(42)
+
+ACCENT  <- "#FF5A5F"   # Inside Airbnb pink (overpriced / accent)
+NEUTRAL <- "#484848"   # dark grey
+BLUE    <- "#2C7BB6"   # underpriced
+
+theme_set(theme_minimal(base_size = 12) +
+            theme(panel.grid.minor = element_blank()))
+
+df  <- readRDS("airbnb_clean.rds")
+mod <- readRDS("model.rds")   # preferred model (M2, additive)
+kn  <- readRDS("key_numbers.rds")
+```
+
+Row {data-height=110}
+-----------------------------------------------------------------------
+
+### Executive summary
+
+```{r summary, results='asis'}
+cat(sprintf(
+"Using **%s active Sydney Airbnb listings** from the Inside Airbnb scrape of **%s**,
+an additive log-linear regression of nightly price on size, room type, location
+and review signals achieves an **adjusted R&sup2; of %.1f%%**. Size dominates —
+each extra bathroom adds about **+%.0f%%** and each bedroom **+%.0f%%** — while
+superhosts earn a **+%.0f%%** premium. Geography is captured by suburb, not raw
+distance: **%s** listings sit about **%.0f%% above** what features alone predict,
+whereas **%s** sits roughly **%.0f%% below**. The map and tables surface where
+individual listings are priced **below** their comparable set (blue, potentially
+underpriced) versus **above** (red).",
+  comma(kn$n_listings), kn$scrape_date, kn$adj_r2,
+  kn$bathroom_pct, kn$bedroom_pct, kn$superhost_pct,
+  kn$top_over_region, kn$top_over_pct,
+  kn$top_under_region, abs(kn$top_under_pct)))
+```
+
+Row {data-height=520}
+-----------------------------------------------------------------------
+
+### Where the mispricing is &nbsp; <span style="color:#2C7BB6">&#9679; under</span> &nbsp; <span style="color:#FF5A5F">&#9679; over</span> &nbsp;(model residual)
+
+```{r map}
+map_df <- df %>% slice_sample(n = min(2000, nrow(df)))
+
+# Diverging palette centred on zero, capped at symmetric quantiles so a few
+# extreme residuals don't wash out the colour scale.
+lim <- quantile(abs(df$residual), 0.95)
+pal <- colorNumeric(c(BLUE, "#f7f7f7", ACCENT),
+                    domain = c(-lim, lim))
+
+leaflet(map_df) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  setView(lng = 151.2093, lat = -33.8688, zoom = 11) %>%
+  addCircleMarkers(
+    ~longitude, ~latitude,
+    radius = 4, stroke = FALSE, fillOpacity = 0.7,
+    color = ~pal(pmax(pmin(residual, lim), -lim)),
+    label = ~sprintf("%s, %s: $%s (model $%s)",
+                     room_type, neighbourhood_group,
+                     comma(round(price)), comma(round(predicted_price)))
+  ) %>%
+  addLegend("bottomright", pal = pal, values = c(-lim, lim),
+            title = "Residual<br>(log price)", opacity = 0.9)
+```
+
+### Most mispriced listings
+
+```{r tables}
+mk <- function(d) {
+  d %>%
+    transmute(Region = neighbourhood_group,
+              `Room type` = room_type,
+              Price = dollar(round(price)),
+              `Model price` = dollar(round(predicted_price)),
+              `% vs model` = round(pct_vs_model)) %>%
+    datatable(rownames = FALSE, options = list(dom = "t", pageLength = 10),
+              class = "compact stripe") %>%
+    formatStyle("% vs model",
+                color = styleInterval(0, c(BLUE, ACCENT)),
+                fontWeight = "bold")
+}
+
+under <- df %>% arrange(residual) %>% slice_head(n = 10)
+over  <- df %>% arrange(desc(residual)) %>% slice_head(n = 10)
+```
+
+#### {.tabset}
+
+##### Underpriced (raise price)
+
+```{r}
+mk(under)
+```
+
+##### Overpriced (model missing features)
+
+```{r}
+mk(over)
+```
+
+Row {data-height=440}
+-----------------------------------------------------------------------
+
+### What drives nightly price (main effects, % per unit, 95% CI)
+
+```{r coef-plot}
+tidy(mod, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(across(c(estimate, conf.low, conf.high), ~ (exp(.) - 1) * 100),
+         term = term %>%
+           str_replace("room_type", "Room: ") %>%
+           str_replace("neighbourhood_group", "Region: ") %>%
+           str_replace("host_is_superhostTRUE", "Superhost") %>%
+           str_replace("dist_to_cbd_km", "Per km from CBD") %>%
+           str_replace("review_scores_rating", "Per review-score point"),
+         term = fct_reorder(term, abs(estimate))) %>%
+  ggplot(aes(estimate, term)) +
+  geom_vline(xintercept = 0, colour = "grey70") +
+  geom_pointrange(aes(xmin = conf.low, xmax = conf.high),
+                  colour = NEUTRAL, fatten = 2) +
+  labs(x = "Effect on nightly price (%)", y = NULL)
+```
+
+### Suburb premium vs what features alone predict
+
+```{r region-premium-plot}
+# How much each region sits above/below a features-only model — the real
+# geographic story (raw distance-to-CBD is not significant once suburb is known).
+kn$region_premium %>%
+  mutate(neighbourhood_group = fct_reorder(neighbourhood_group, premium_pct),
+         sign = if_else(premium_pct >= 0, "above", "below")) %>%
+  ggplot(aes(premium_pct, neighbourhood_group, fill = sign)) +
+  geom_col() +
+  geom_vline(xintercept = 0, colour = "grey60") +
+  scale_fill_manual(values = c(above = ACCENT, below = BLUE), guide = "none") +
+  scale_x_continuous(labels = function(x) paste0(x, "%")) +
+  labs(x = "Average premium vs features-only model", y = NULL)
+```

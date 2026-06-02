@@ -1,0 +1,11 @@
+# Raw data (re-downloadable from Inside Airbnb; can exceed GitHub limits)
+listings.csv.gz
+listings_*.csv.gz
+calendar.csv.gz
+
+# R session cruft
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+_inspect.*

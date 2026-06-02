@@ -1,0 +1,495 @@
+---
+title: "Sydney Airbnb Pricing — Analysis"
+subtitle: "COMM3501 Module 1 portfolio project"
+author: "Colin Priest"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: cosmo
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 7, fig.height = 4.5, dpi = 96)
+set.seed(42)  # reproducible random sampling throughout
+
+# Data loading, preparation and tibbles are all done with the tidyverse.
+library(tidyverse)
+library(janitor)
+library(skimr)
+library(leaflet)
+library(broom)
+library(car)
+library(scales)
+
+# Project accent palette (reused in the dashboard).
+ACCENT  <- "#FF5A5F"  # Inside Airbnb pink
+NEUTRAL <- "#484848"  # dark grey
+theme_set(theme_minimal(base_size = 11) +
+            theme(panel.grid.minor = element_blank()))
+```
+
+# Introduction
+
+This notebook fits a **log-linear regression of nightly price** on listing
+features, geography, and review signals for Sydney Airbnb listings, using only
+Module 1 methods (EDA, multiple regression, dummy variables, interactions, log
+transforms, and residual diagnostics).
+
+**A note on the data vintage.** Inside Airbnb's most recent Sydney release
+(2025-09-12) ships the `price` column completely blank in both
+`listings.csv.gz` and `calendar.csv.gz` — there is no nightly price to model.
+I therefore use the most recent Sydney scrape that still publishes prices,
+**2023-06-06**. This is documented in the README and is the kind of data-quality
+check worth doing before any modelling.
+
+# Load and first look
+
+```{r load}
+# read_csv (readr / tidyverse) handles the gzip and quoted multi-line fields.
+raw <- read_csv("listings.csv.gz", show_col_types = FALSE) |>
+  clean_names()
+
+dim(raw)            # rows, columns
+```
+
+```{r glimpse-types}
+# A one-line summary of every column.
+skim(raw %>% select(price, accommodates, bedrooms, bathrooms_text,
+                     room_type, neighbourhood_cleansed,
+                     review_scores_rating, number_of_reviews,
+                     host_is_superhost, latitude, longitude))
+```
+
+The `price` column arrives as a string (`"$1,250.00"`) and `bathrooms_text`
+as free text (`"2 baths"`, `"1 shared bath"`, `"Half-bath"`). Both are cleaned
+below. `neighbourhood_cleansed` holds the 38 Sydney LGAs, which we will bundle
+into a handful of interpretable regions.
+
+# Exploratory data analysis
+
+## Price — the case for a log transform
+
+```{r price-clean-eda}
+# Strip "$" and "," then coerce to numeric (readr::parse_number does both).
+raw <- raw %>% mutate(price_num = parse_number(price))
+
+raw %>%
+  summarise(n = sum(!is.na(price_num)),
+            min = min(price_num, na.rm = TRUE),
+            median = median(price_num, na.rm = TRUE),
+            mean = mean(price_num, na.rm = TRUE),
+            p99 = quantile(price_num, 0.99, na.rm = TRUE),
+            max = max(price_num, na.rm = TRUE))
+```
+
+```{r price-hist, fig.height=3.6}
+# Side-by-side: raw price (heavily right-skewed) vs log price (near-normal).
+plot_df <- raw %>%
+  filter(!is.na(price_num), price_num >= 30, price_num <= 2000)
+
+p1 <- ggplot(plot_df, aes(price_num)) +
+  geom_histogram(bins = 60, fill = ACCENT, colour = "white") +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(title = "Nightly price", x = NULL, y = "Listings")
+
+p2 <- ggplot(plot_df, aes(log(price_num))) +
+  geom_histogram(bins = 60, fill = NEUTRAL, colour = "white") +
+  labs(title = "log(price)", x = NULL, y = NULL)
+
+cowplot::plot_grid(p1, p2, nrow = 1)
+```
+
+*Raw price is sharply right-skewed; the log transform is approximately
+bell-shaped, which justifies modelling `log(price)` rather than `price`
+(lecture slide 138).*
+
+## Other numeric columns
+
+```{r numeric-hist, fig.height=3.6}
+raw %>%
+  transmute(accommodates,
+            bedrooms,
+            number_of_reviews,
+            review_scores_rating) %>%
+  pivot_longer(everything()) %>%
+  filter(!is.na(value)) %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins = 30, fill = NEUTRAL, colour = "white") +
+  facet_wrap(~name, scales = "free") +
+  labs(x = NULL, y = "Listings")
+```
+
+*`accommodates` and `bedrooms` are right-skewed count variables;
+`number_of_reviews` has a long tail; `review_scores_rating` clusters near the
+top of the 0–5 scale (most rated listings sit above 4.5).*
+
+## Categorical columns
+
+```{r cat-bars, fig.height=3.6}
+b1 <- raw %>% count(room_type, sort = TRUE) %>%
+  ggplot(aes(fct_reorder(room_type, n), n)) +
+  geom_col(fill = ACCENT) + coord_flip() +
+  labs(title = "Room type", x = NULL, y = NULL)
+
+b2 <- raw %>% count(host_is_superhost) %>%
+  ggplot(aes(factor(host_is_superhost), n)) +
+  geom_col(fill = NEUTRAL) +
+  labs(title = "Superhost", x = NULL, y = NULL)
+
+cowplot::plot_grid(b1, b2, nrow = 1)
+```
+
+*Entire homes/apartments dominate the listing mix; private rooms are the main
+alternative, with hotel and shared rooms negligible. Roughly a third of hosts
+hold superhost status.*
+
+## Missing values
+
+```{r missing}
+raw %>%
+  summarise(across(c(price_num, bedrooms, accommodates, bathrooms_text,
+                     review_scores_rating, number_of_reviews),
+                   ~ sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "n_missing") %>%
+  arrange(desc(n_missing))
+```
+
+*`review_scores_rating` is missing exactly for listings with no reviews — a
+structural, not random, gap. We retain those listings (dropping them would
+discard a sizeable share of the market) and handle the missing score
+explicitly in feature engineering.*
+
+## Geographic sanity check
+
+```{r sanity-map}
+# 1,000 random listings, coloured by room type, to confirm coordinates are sane.
+pal_rt <- colorFactor("Set1", raw$room_type)
+raw %>%
+  slice_sample(n = 1000) %>%
+  leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  setView(lng = 151.2093, lat = -33.8688, zoom = 10) %>%
+  addCircleMarkers(~longitude, ~latitude, radius = 3, stroke = FALSE,
+                   fillOpacity = 0.6, color = ~pal_rt(room_type)) %>%
+  addLegend("bottomright", pal = pal_rt, values = ~room_type, title = "Room type")
+```
+
+*Listings fall where we expect them — dense around the CBD, the eastern
+beaches, and the lower north shore — confirming the coordinates are usable.*
+
+# Feature engineering and cleaning
+
+```{r haversine}
+# Great-circle distance (km) from each listing to the Sydney CBD.
+haversine_km <- function(lat, lon, lat0 = -33.8688, lon0 = 151.2093) {
+  R <- 6371                       # Earth radius, km
+  to_rad <- function(d) d * pi / 180
+  dlat <- to_rad(lat - lat0)
+  dlon <- to_rad(lon - lon0)
+  a <- sin(dlat / 2)^2 +
+       cos(to_rad(lat0)) * cos(to_rad(lat)) * sin(dlon / 2)^2
+  2 * R * asin(pmin(1, sqrt(a)))
+}
+```
+
+```{r parse-bathrooms}
+# Parse bathrooms_text into a numeric count + a shared-bathroom flag.
+parse_baths <- function(x) {
+  x_l <- str_to_lower(x)
+  num <- parse_number(x_l)                     # "1.5 baths" -> 1.5
+  # "Half-bath" / "Private half-bath" / "Shared half-bath" -> 0.5
+  ifelse(str_detect(x_l, "half"), 0.5, num)
+}
+
+clean <- raw %>%
+  mutate(
+    price          = price_num,
+    bathrooms      = parse_baths(bathrooms_text),
+    shared_bath    = str_detect(str_to_lower(bathrooms_text), "shared"),
+    log_price      = log(price),
+    dist_to_cbd_km = haversine_km(latitude, longitude),
+    is_entire_home = room_type == "Entire home/apt",
+    has_reviews    = number_of_reviews > 0,
+    host_is_superhost = host_is_superhost %in% c(TRUE, "t")
+  )
+```
+
+```{r neighbourhood-group}
+# Bundle the 38 LGAs into 10 interpretable regions using local Sydney knowledge.
+clean <- clean %>%
+  mutate(neighbourhood_group = case_when(
+    neighbourhood_cleansed %in% c("Sydney") ~ "City",
+    neighbourhood_cleansed %in% c("Waverley", "Randwick", "Woollahra") ~ "Eastern Suburbs",
+    neighbourhood_cleansed %in% c("Marrickville", "Leichhardt", "Canada Bay",
+      "Ashfield", "Burwood", "Strathfield", "Canterbury", "Inner West") ~ "Inner West",
+    neighbourhood_cleansed %in% c("North Sydney", "Mosman", "Willoughby",
+      "Lane Cove", "Hunters Hill") ~ "Lower North Shore",
+    neighbourhood_cleansed %in% c("Ku-Ring-Gai", "Hornsby", "Ryde") ~ "Upper North Shore",
+    neighbourhood_cleansed %in% c("Manly", "Warringah", "Pittwater",
+      "Northern Beaches") ~ "Northern Beaches",
+    neighbourhood_cleansed %in% c("Botany Bay", "Rockdale", "Hurstville",
+      "City Of Kogarah", "Bayside", "Georges River") ~ "Inner South",
+    neighbourhood_cleansed %in% c("Sutherland Shire") ~ "Sutherland",
+    neighbourhood_cleansed %in% c("The Hills Shire") ~ "Hills",
+    neighbourhood_cleansed %in% c("Parramatta", "Auburn", "Holroyd", "Cumberland",
+      "Blacktown", "Penrith", "Liverpool", "Fairfield", "Bankstown",
+      "Canterbury-Bankstown", "Campbelltown", "Camden", "Blue Mountains",
+      "Hawkesbury", "Wollondilly") ~ "Western Sydney",
+    TRUE ~ "Other Sydney"
+  ))
+
+# Safety check: confirm nothing fell through to "Other Sydney".
+clean %>% count(neighbourhood_group, sort = TRUE)
+```
+
+```{r filters}
+n_before <- nrow(clean)
+
+model_df <- clean %>%
+  filter(!is.na(price), price >= 30, price <= 2000,  # drop implausible / luxury outliers
+         !is.na(bedrooms), !is.na(accommodates),     # core size predictors required
+         !is.na(bathrooms),
+         !is.na(dist_to_cbd_km)) %>%
+  mutate(
+    # Structural missingness: impute the median rating for no-review listings,
+    # already flagged by has_reviews (documented choice, see write-up).
+    review_scores_rating = if_else(is.na(review_scores_rating),
+                                   median(review_scores_rating, na.rm = TRUE),
+                                   review_scores_rating),
+    # Reference categories chosen for interpretability.
+    room_type = fct_relevel(factor(room_type), "Entire home/apt"),
+    neighbourhood_group = fct_relevel(factor(neighbourhood_group), "City")
+  )
+
+tibble(stage = c("raw", "after filters"),
+       rows  = c(n_before, nrow(model_df)),
+       dropped = c(NA, n_before - nrow(model_df)))
+```
+
+**Filter rationale.** We drop listings below \$30 (data errors / non-genuine
+listings) and above \$2,000 per night (a handful of luxury properties whose
+pricing is driven by features the data cannot capture, e.g. waterfront
+mansions). The 99th percentile of price sits far below \$2,000, so this trims a
+thin upper tail rather than the body of the market. Listings missing the core
+size variables (`bedrooms`, `accommodates`, `bathrooms`) are dropped because
+they cannot enter the model. Zero-review listings are **kept**, with their
+missing review score imputed to the median and flagged by `has_reviews`.
+
+```{r save-clean}
+saveRDS(model_df, "airbnb_clean.rds")
+```
+
+# Models
+
+```{r models}
+m1 <- lm(log_price ~ accommodates + bedrooms + bathrooms, data = model_df)
+
+m2 <- lm(log_price ~ accommodates + bedrooms + bathrooms +
+           room_type + neighbourhood_group + dist_to_cbd_km +
+           review_scores_rating + host_is_superhost, data = model_df)
+
+m3 <- lm(log_price ~ accommodates + bedrooms + bathrooms +
+           room_type + neighbourhood_group + dist_to_cbd_km +
+           review_scores_rating + host_is_superhost +
+           room_type:neighbourhood_group, data = model_df)
+```
+
+## Model comparison
+
+```{r compare}
+model_compare <- bind_rows(
+  glance(m1) %>% mutate(model = "M1: size only"),
+  glance(m2) %>% mutate(model = "M2: full additive"),
+  glance(m3) %>% mutate(model = "M3: + interaction")
+) %>%
+  transmute(model,
+            adj_r_squared = round(adj.r.squared, 3),
+            resid_se = round(sigma, 3),
+            n_params = nobs - df.residual,   # number of coefficients (incl. intercept)
+            AIC = round(AIC, 0))
+
+model_compare
+```
+
+*Adjusted R² rises sharply from M1 (size only) to M2 (adding room type,
+geography, and reviews), but then barely moves from M2 to M3 — the interaction
+block buys only about 0.2 percentage points. Because all three share the same
+response (`log_price`), the slide-67 rule applies, but here the gain from the
+interaction is negligible against the ~16 extra parameters it costs.
+**I therefore prefer the additive Model 2** on parsimony grounds, and use it for
+interpretation, diagnostics, and the dashboard. (Model 3 is still examined below
+to confirm the interaction is not doing meaningful work.)*
+
+## Coefficient interpretation (back-transformed)
+
+```{r coef-interp}
+# Percentage effect of a one-unit change = (exp(b) - 1) * 100%.
+tidy(m2) %>%
+  filter(term %in% c("bathrooms", "bedrooms", "accommodates",
+                     "room_typePrivate room", "host_is_superhostTRUE",
+                     "review_scores_rating", "dist_to_cbd_km")) %>%
+  mutate(pct_effect = round((exp(estimate) - 1) * 100, 1)) %>%
+  select(term, estimate, pct_effect, p.value)
+```
+
+Reading these from the preferred additive model (M2), in plain business terms:
+
+- **Each extra bathroom** adds about **+23%** to the nightly price, and **each
+  extra bedroom** about **+18%** — size is the dominant driver.
+- **Private room** vs entire home: roughly **−20%** cheaper for an otherwise
+  identical listing. Note this market is ~96% entire homes (only 487 private
+  rooms survive filtering), so this estimate, while strongly significant, rests
+  on a small slice of the data.
+- **Superhost** status carries a **+14%** premium — small but very significant.
+- **Distance to the CBD is *not* significant** (p ≈ 0.12). This is not a
+  mistake: it is the slide-40 "partial effect" lesson in action. Once we know a
+  listing's *region*, its raw kilometres-from-CBD adds nothing — Bondi is
+  expensive because it is in the Eastern Suburbs, not because of its distance.
+  The neighbourhood dummies have already absorbed the geography.
+
+## Joint significance of the interaction
+
+```{r anova-interaction}
+anova(m2, m3)   # F-test: does the room_type x neighbourhood interaction help?
+```
+
+*The F-test is significant (p ≈ 3 × 10⁻¹²), so the interaction is statistically
+detectable — at n ≈ 15,700 even tiny effects clear significance. But it lifts
+adjusted R² by only ~0.2 points, which is **practically** negligible. With the
+market ~96% entire homes, there is little room-type variation for an interaction
+to exploit. This is a clean example of statistical vs practical significance,
+and it confirms the choice of the simpler M2.*
+
+# Diagnostics
+
+```{r resid-fitted, fig.height=3.8}
+# Diagnostics on the preferred model, M2.
+diag_df <- tibble(fitted = fitted(m2), resid = residuals(m2))
+
+ggplot(diag_df, aes(fitted, resid)) +
+  geom_point(alpha = 0.15, colour = NEUTRAL) +
+  geom_hline(yintercept = 0, colour = ACCENT) +
+  geom_smooth(se = FALSE, colour = ACCENT, linewidth = 0.6) +
+  labs(title = "Residuals vs fitted", x = "Fitted log(price)", y = "Residual")
+```
+
+*The spread of residuals widens with fitted values — a funnel shape, i.e.
+**heteroskedasticity** (slide 107). OLS coefficients stay unbiased but their
+standard errors are understated; White/robust (HC) standard errors via the
+`sandwich` package would be the appropriate fix. We flag rather than implement
+this, as robust SEs are beyond Module 1.*
+
+```{r qq, fig.height=3.8}
+ggplot(diag_df, aes(sample = resid)) +
+  stat_qq(alpha = 0.2, colour = NEUTRAL) + stat_qq_line(colour = ACCENT) +
+  labs(title = "Normal Q-Q plot of residuals", x = "Theoretical", y = "Sample")
+```
+
+*Both tails depart from the line (heavy-tailed residuals, slide 118). With
+~20k observations, inference on coefficients remains approximately valid by the
+CLT, but prediction intervals for individual listings will be optimistic.*
+
+```{r vif}
+# VIF is computed on the additive model M2: with interaction terms present,
+# VIFs are mechanically inflated and not interpretable, so we assess
+# multicollinearity on M2 (the standard practice).
+vif(m2)
+```
+
+*Among the size variables, `accommodates`, `bedrooms`, and `bathrooms` are
+correlated, but VIFs stay in the low single digits — moderate, not damaging
+(slide 102). We retain all three; none exceeds the conventional threshold of 5
+that would prompt dropping a variable.*
+
+```{r shapiro}
+# Shapiro-Wilk caps at n = 5,000, so test a random sample of residuals.
+shapiro.test(sample(residuals(m2), 5000))
+```
+
+*Shapiro-Wilk rejects normality — expected at this sample size and consistent
+with the Q-Q plot. The honest summary of the diagnostics: **heteroskedasticity
+is present, residuals are heavy-tailed and non-normal, and there is moderate
+(not severe) multicollinearity among the size variables.** None of these
+invalidates the large-sample coefficient inference that drives the conclusions.*
+
+# Predictions and residuals for the dashboard
+
+```{r predictions}
+# Predictions come from the preferred model, M2.
+scored <- model_df %>%
+  mutate(
+    predicted_log   = predict(m2, model_df),
+    predicted_price = exp(predicted_log),
+    residual        = log_price - predicted_log,           # < 0 => below model = potentially underpriced
+    pct_vs_model    = (price / predicted_price - 1) * 100  # actual vs predicted, %
+  )
+
+saveRDS(scored, "airbnb_clean.rds")   # overwrite with predictions attached
+saveRDS(m2, "model.rds")              # preferred model for the dashboard
+```
+
+```{r top-tables}
+top_under <- scored %>% arrange(residual) %>% slice_head(n = 10) %>%
+  select(neighbourhood_group, room_type, price, predicted_price, pct_vs_model)
+top_over  <- scored %>% arrange(desc(residual)) %>% slice_head(n = 10) %>%
+  select(neighbourhood_group, room_type, price, predicted_price, pct_vs_model)
+
+top_under
+top_over
+```
+
+*Negative residuals (top table) are listings priced **below** what their
+features predict — candidates for a price rise. Positive residuals are priced
+**above** prediction; this does **not** prove the host is overcharging, only
+that the model is missing a feature (a harbour view, a recent renovation, a
+bridge sightline). We frame it that way deliberately.*
+
+# Key numbers (exported for the dashboard and README)
+
+```{r key-numbers}
+# "Region premium" = mean residual from a FEATURES-ONLY model (no geography),
+# i.e. how much each region sits above/below what listing features alone predict.
+# (Average residuals from M2 are ~0 within each region, because M2 already
+# contains the neighbourhood dummies — so we need the features-only model here.)
+m_features <- lm(log_price ~ accommodates + bedrooms + bathrooms + room_type +
+                   review_scores_rating + host_is_superhost, data = scored)
+
+region_premium <- scored %>%
+  mutate(res_feat = residuals(m_features)) %>%
+  group_by(neighbourhood_group) %>%
+  summarise(n = n(), premium_pct = round((exp(mean(res_feat)) - 1) * 100, 1)) %>%
+  arrange(desc(premium_pct))
+
+co  <- coef(m2)
+pct <- function(b) round((exp(b) - 1) * 100, 1)
+
+key_numbers <- list(
+  n_listings  = nrow(scored),
+  scrape_date = "2023-06-06",
+  adj_r2      = round(summary(m2)$adj.r.squared * 100, 1),  # preferred model (M2)
+  adj_r2_m1   = round(summary(m1)$adj.r.squared * 100, 1),
+  adj_r2_m3   = round(summary(m3)$adj.r.squared * 100, 1),
+  bathroom_pct     = pct(co[["bathrooms"]]),
+  bedroom_pct      = pct(co[["bedrooms"]]),
+  private_room_pct = pct(co[["room_typePrivate room"]]),
+  superhost_pct    = pct(co[["host_is_superhostTRUE"]]),
+  dist_km_pct      = pct(co[["dist_to_cbd_km"]]),
+  dist_km_p        = round(summary(m2)$coefficients["dist_to_cbd_km", "Pr(>|t|)"], 3),
+  region_premium   = region_premium,
+  top_over_region  = as.character(region_premium$neighbourhood_group[1]),
+  top_over_pct     = region_premium$premium_pct[1],
+  top_under_region = as.character(tail(region_premium$neighbourhood_group, 1)),
+  top_under_pct    = tail(region_premium$premium_pct, 1)
+)
+saveRDS(key_numbers, "key_numbers.rds")
+key_numbers
+```
+
+The dashboard (`dashboard.Rmd`) reads `airbnb_clean.rds`, `model.rds`, and
+`key_numbers.rds` to build the map, tables, and effect plots, and the README's
+executive summary quotes these figures directly.
