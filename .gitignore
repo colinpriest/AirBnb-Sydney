@@ -1,5 +1,8 @@
-# Raw data (re-downloadable from Inside Airbnb; can exceed GitHub limits)
-listings.csv.gz
+# Instructor materials — private companion doc, never publish
+instructor_notes.*
+
+# Raw data IS committed to this repo (see README) for full reproducibility.
+# Only ignore the price-less 2025 variant and the calendar file.
 listings_*.csv.gz
 calendar.csv.gz
 
@@ -9,3 +12,5 @@ calendar.csv.gz
 .RData
 .Ruserdata
 _inspect.*
+_shot.*
+_check.*

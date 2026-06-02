@@ -44,7 +44,7 @@ install.packages(c("tidyverse", "janitor", "skimr", "leaflet",
                    "flexdashboard", "broom", "car", "DT",
                    "scales", "ggthemes", "plotly", "cowplot"))
 
-# 1. Download the Sydney listings.csv.gz (2023-06-06) — see citation below.
+# 1. The raw Sydney listings.csv.gz (2023-06-06) is already in this repo.
 # 2. Render the analysis notebook (produces airbnb_clean.rds + model.rds):
 rmarkdown::render("analysis.Rmd")
 # 3. Render the dashboard:
@@ -76,5 +76,6 @@ Sydney scrape that still publishes prices, **2023-06-06**.
 Data: Inside Airbnb, Sydney listings scraped 2023-06-06.
 <https://insideairbnb.com> — released under a Creative Commons licence.
 
-The raw `listings.csv.gz` is git-ignored (re-downloadable from the link above);
-the cleaned `airbnb_clean.rds` is the modelling input used by the dashboard.
+The raw `listings.csv.gz` (Sydney, 2023-06-06) is committed to this repo for full
+reproducibility; the cleaned `airbnb_clean.rds` is the modelling input used by the
+dashboard.
